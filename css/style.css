@@ -1,0 +1,83 @@
+/* 組合 4B：普魯士藍底撞亮橘（日系柿子橘）設計系統 */
+:root {
+  --orange-persimmon: #ED6D35;
+  --orange-persimmon-hover: #D65A24;
+  --blue-prussian: #1D3557;
+  --blue-ultramarine: #004E89;
+  --cream-buffer: #FAF3E0;
+  --bg-canvas: #F7F5F0;
+}
+
+body {
+  font-family: "Noto Sans TC", "Microsoft JhengHei", -apple-system, BlinkMacSystemFont, sans-serif;
+  background-color: var(--blue-prussian);
+  color: var(--blue-prussian);
+}
+
+/* 全站表格表頭統一採用普魯士藍底配純白字 */
+table thead th {
+  background-color: var(--blue-prussian);
+  color: #ffffff;
+  font-weight: 700;
+  border-bottom: 2px solid var(--orange-persimmon);
+}
+
+/* 頂部純線條圖示懸浮提示 */
+.icon-tip {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.icon-tip .tip-text {
+  visibility: hidden;
+  opacity: 0;
+  position: absolute;
+  top: 100%;
+  right: 0;
+  margin-top: 6px;
+  padding: 4px 8px;
+  border-radius: 4px;
+  background-color: #0f1e36;
+  color: #ffffff;
+  font-size: 11px;
+  white-space: nowrap;
+  z-index: 60;
+  pointer-events: none;
+  box-shadow: 0 4px 10px rgba(0, 0, 0, 0.25);
+  transition: opacity 0.15s ease;
+}
+
+.icon-tip:hover .tip-text {
+  visibility: visible;
+  opacity: 1;
+}
+
+/* 表單控制項聚焦提示色 */
+input:focus,
+select:focus,
+textarea:focus {
+  outline: none;
+  border-color: var(--orange-persimmon);
+  box-shadow: 0 0 0 2px rgba(237, 109, 53, 0.18);
+}
+
+/* 細緻捲軸樣式 */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: rgba(29, 53, 87, 0.06);
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(29, 53, 87, 0.28);
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--orange-persimmon);
+}

@@ -42,15 +42,17 @@ async function reloadAllV2Data(forceNotify) {
 function switchMainTab(tab) {
   currentMainTab = tab;
   const map = {
-    approval: ["mainTabApproval", "viewApproval"],
-    progress: ["mainTabProgress", "viewProgress"],
-    budget: ["mainTabBudget", "viewBudget"],
-    history: ["mainTabHistory", "viewHistory"]
+    approval: ["mainTabApproval", "viewApproval", "navBadgeApproved"],
+    progress: ["mainTabProgress", "viewProgress", "navBadgePureEng"],
+    budget: ["mainTabBudget", "viewBudget", "navBadgeBudget"],
+    ecology: ["mainTabEcology", "viewEcology", "navBadgeEcology"],
+    history: ["mainTabHistory", "viewHistory", null]
   };
   Object.keys(map).forEach(k => {
-    const [btnId, viewId] = map[k];
+    const [btnId, viewId, badgeId] = map[k];
     const active = k === tab;
     $(viewId)?.classList.toggle("hidden", !active);
+
     const btn = $(btnId);
     if (btn) {
       btn.classList.toggle("bg-[#1D3557]", active);
@@ -59,10 +61,30 @@ function switchMainTab(tab) {
       btn.classList.toggle("text-[#1D3557]/75", !active);
       btn.classList.toggle("hover:text-[#1D3557]", !active);
     }
+
+    if (badgeId) {
+      const badge = $(badgeId);
+      if (badge) {
+        badge.classList.remove("bg-[#ED6D35]", "text-white", "bg-[#1D3557]/12", "bg-[#1D3557]/10", "text-[#1D3557]");
+        if (active) {
+          badge.classList.add("bg-[#ED6D35]", "text-white");
+        } else {
+          badge.classList.add("bg-[#1D3557]/12", "text-[#1D3557]");
+        }
+      }
+    }
   });
+
+  if (tab === "progress" && typeof renderProgressView === "function") {
+    renderProgressView();
+  }
 
   if (tab === "budget" && typeof renderBudgetView === "function") {
     renderBudgetView();
+  }
+
+  if (tab === "ecology" && typeof renderEcologicalView === "function") {
+    renderEcologicalView();
   }
 
   if (tab !== "history") {
@@ -161,7 +183,9 @@ async function loadAllData(forceNotify) {
       "附表": normalizeText(r["附表"]),
       "分署": normalizeText(r["分署"]).replace("水規所", "水規分署"),
       "縣市": normalizeText(r["縣市"]).replace(/台/g, "臺"),
+      "鄉鎮": normalizeText(r["鄉鎮"]).replace(/台/g, "臺"),
       "水系": normalizeText(r["水系"]),
+      "溪別": normalizeText(r["溪別"]),
       "案件名稱": normalizeText(r["案件名稱"]),
       "工程編號": normalizeText(r["工程編號"]),
       "座標點位": normalizeText(r["座標點位"]),
@@ -259,7 +283,7 @@ function applyFilters() {
       if (target !== "【全部縣市】" && !r["縣市"].includes(target)) return false;
       if (sub !== "【全部分署】" && r["分署"] !== sub) return false;
     }
-    if (kw && !`${r["案件名稱"]} ${r["水系"]} ${r["工程編號"]} ${r["備註資訊"]} ${r["地方關切"]}`.toLowerCase().includes(kw)) return false;
+    if (kw && !`${r["案件名稱"]} ${r["水系"]} ${r["溪別"] || ""} ${r["工程編號"]} ${r["備註資訊"]} ${r["地方關切"]}`.toLowerCase().includes(kw)) return false;
     return true;
   });
 
@@ -343,10 +367,9 @@ function renderConcernCell(rawVal) {
 }
 
 function renderDetailTable() {
-  const isAdmin = Boolean(adminPasscode);
+  const isAdmin = typeof canEditHistory === "function" ? canEditHistory() : Boolean(adminPasscode);
   $("thActionCol")?.classList.toggle("hidden", !isAdmin);
   if ($("colActionWidth")) $("colActionWidth").style.width = isAdmin ? "44px" : "0px";
-  if (typeof syncV2AuthUI === "function") syncV2AuthUI();
 
   const displayRows = detailAuditMode === "merged" ? mergedDuplicateRecords : (detailAuditMode === "zero" ? zeroBudgetRecords : filteredRecords);
   if ($("lblDetailSummary")) {

@@ -1,16 +1,47 @@
 /**
- * 治水雲庫 V2 — 年度核定案件 ＋ 雙軌分權狀態管理
+ * 治水雲庫 V2 — 年度核定案件 ＋ 四軌權限狀態管理 ＋ case_uid 終身身分制
+ * 四種身分：
+ * A. admin（系統管理）：最高權限
+ * B. budget（經費登載）：僅可編輯「案件經費登載」
+ * C. progress（工程管考）：可編輯全署「工程進度管考」與通報排程設定
+ * D. branch（河川分署）：可填報所屬分署「工程進度管考」期程與進度並簽認，亦可維護生態檢核執行廠商與經費
  */
 
 let v2ActiveCases = [];
 let v2BudgetMap = {}; // { case_uid: budgetRecord }
 let v2CurrentMonth = "";
 let v2LifecycleLoaded = false;
-let branchSession = { branch: "", passcode: "" };
 let v2PendingApprovalImport = [];
+
+// 四軌統一權限狀態
+let v2AuthState = {
+  role: "guest", // "guest" | "admin" | "budget" | "progress" | "branch"
+  passcode: "",
+  branch: "",
+  label: "檢視模式"
+};
+let v2SelectedLoginRole = "admin";
+let branchSession = { branch: "", passcode: "" };
 
 const V2_BRANCH_KEYS = ["一", "二", "三", "四", "五", "六", "七", "八", "九", "十", "水規分署"];
 const V2_PURE_ENG_CATEGORIES = ["工程", "維修改善工程"];
+
+// ========== 四軌權限判斷輔助函式 ==========
+function canEditApproval() {
+  return v2AuthState.role === "admin";
+}
+
+function canEditBudget() {
+  return v2AuthState.role === "admin" || v2AuthState.role === "budget";
+}
+
+function canEditProgress() {
+  return v2AuthState.role === "admin" || v2AuthState.role === "progress" || v2AuthState.role === "branch";
+}
+
+function canEditHistory() {
+  return v2AuthState.role === "admin";
+}
 
 function v2IsPureEngineering(c) {
   return V2_PURE_ENG_CATEGORIES.includes(String(c["類別"] || "").trim());
@@ -29,74 +60,216 @@ function v2DisplayBranch(raw) {
   return k === "水規分署" ? "水規分署" : `${k}分署`;
 }
 
-function switchLoginRole(role) {
-  const isB = role === "branch";
-  const btnA = document.getElementById("btnRoleAdmin");
-  const btnB = document.getElementById("btnRoleBranch");
-  if (btnA && btnB) {
-    btnA.classList.toggle("bg-[#ED6D35]", !isB);
-    btnA.classList.toggle("text-white", !isB);
-    btnA.classList.toggle("text-[#1D3557]", isB);
-    btnB.classList.toggle("bg-[#004E89]", isB);
-    btnB.classList.toggle("text-white", isB);
-    btnB.classList.toggle("text-[#1D3557]", !isB);
-  }
-  document.getElementById("adminLoginPanel")?.classList.toggle("hidden", isB);
-  document.getElementById("branchLoginPanel")?.classList.toggle("hidden", !isB);
+function v2GetNormalizedCoreName(rawName) {
+  const base = typeof getCoreProjectName === "function"
+    ? getCoreProjectName(rawName)
+    : String(rawName || "").replace(/^1\d{2}年度?/, "").trim();
+  return String(base || "")
+    .replace(/（[^）]*）/g, "")
+    .replace(/\([^)]*\)/g, "")
+    .replace(/[\s\-_．.]/g, "")
+    .trim();
 }
 
-async function submitBranchLogin() {
-  const branch = document.getElementById("selLoginBranch").value;
-  const pass = document.getElementById("inputBranchPass").value.trim();
-  if (!branch || !pass) return alert("請選擇分署並輸入通行碼");
+function findCrossYearCandidateForImport(rec) {
+  const yr = String(rec["核定年度"] || "").trim();
+  const brKey = v2NormBranch(rec["分署"]);
+  const cat = String(rec["類別"] || "").trim();
+  const core = v2GetNormalizedCoreName(rec["案件名稱"]);
+  if (!brKey || !core || core.length < 4) return null;
+
+  const candidates = (v2ActiveCases || []).filter(c => {
+    if (c.lifecycle_stage === "撤案" || c.lifecycle_stage === "已結案入庫") return false;
+    if (String(c["核定年度"] || "").trim() === yr) return false;
+    if (v2NormBranch(c["分署"]) !== brKey) return false;
+    if (String(c["類別"] || "").trim() !== cat) return false;
+    return v2GetNormalizedCoreName(c["案件名稱"]) === core;
+  });
+
+  if (!candidates.length) return null;
+  candidates.sort((a, b) => (parseInt(b["核定年度"], 10) || 0) - (parseInt(a["核定年度"], 10) || 0));
+  return candidates[0];
+}
+
+// ========== 登入彈窗控制（獨立接管） ==========
+function openAdminModal() {
+  const modal = document.getElementById("modalAdmin");
+  if (!modal) return alert("找不到登入視窗元件，請確認 index.html 是否已更新");
+  modal.classList.remove("hidden");
+  switchLoginRole(v2SelectedLoginRole || "admin");
+}
+
+function closeAdminModal() {
+  document.getElementById("modalAdmin")?.classList.add("hidden");
+}
+
+function switchLoginRole(role) {
+  v2SelectedLoginRole = ["admin", "budget", "progress", "branch"].includes(role) ? role : "admin";
+  const roles = [
+    { key: "admin", btnId: "btnRoleAdmin", panelId: "panelRoleAdmin", activeBg: "bg-[#ED6D35]", inputId: "inputAdminPass" },
+    { key: "budget", btnId: "btnRoleBudget", panelId: "panelRoleBudget", activeBg: "bg-[#004E89]", inputId: "inputBudgetPass" },
+    { key: "progress", btnId: "btnRoleProgress", panelId: "panelRoleProgress", activeBg: "bg-[#004E89]", inputId: "inputProgressPass" },
+    { key: "branch", btnId: "btnRoleBranch", panelId: "panelRoleBranch", activeBg: "bg-[#1D3557]", inputId: "inputBranchPass" }
+  ];
+
+  roles.forEach(r => {
+    const active = r.key === v2SelectedLoginRole;
+    const btn = document.getElementById(r.btnId);
+    const panel = document.getElementById(r.panelId);
+    if (btn) {
+      btn.classList.remove("bg-[#ED6D35]", "bg-[#004E89]", "bg-[#1D3557]", "text-white", "text-[#1D3557]");
+      if (active) {
+        btn.classList.add(r.activeBg, "text-white");
+      } else {
+        btn.classList.add("text-[#1D3557]");
+      }
+    }
+    if (panel) panel.classList.toggle("hidden", !active);
+    if (active && r.inputId) {
+      setTimeout(() => document.getElementById(r.inputId)?.focus(), 30);
+    }
+  });
+}
+
+async function submitV2Login() {
+  const role = v2SelectedLoginRole;
+  let passcode = "";
+  let branch = "";
+
+  if (role === "admin") {
+    passcode = document.getElementById("inputAdminPass")?.value.trim() || "";
+  } else if (role === "budget") {
+    passcode = document.getElementById("inputBudgetPass")?.value.trim() || "";
+  } else if (role === "progress") {
+    passcode = document.getElementById("inputProgressPass")?.value.trim() || "";
+  } else if (role === "branch") {
+    branch = document.getElementById("selLoginBranch")?.value || "";
+    passcode = document.getElementById("inputBranchPass")?.value.trim() || "";
+  }
+
+  if (!passcode) return alert("請輸入登入密碼");
+
+  const btn = document.getElementById("btnSubmitV2Login");
+  if (btn) { btn.disabled = true; btn.textContent = "驗證中..."; }
+
   try {
     const res = await fetch(GAS_API_URL, {
       method: "POST",
-      body: JSON.stringify({ action: "verify_branch", branch, passcode: pass })
+      body: JSON.stringify({ action: "verify_login", role, branch, passcode })
     });
     const json = await res.json();
     if (json.status === "success") {
-      if (adminPasscode && typeof logoutAdmin === "function") logoutAdmin();
-      branchSession = { branch: json.branch, passcode: pass };
+      v2AuthState = {
+        role: json.role || role,
+        passcode,
+        branch: json.branch || branch || "",
+        label: json.label || "已登入"
+      };
+
+      adminPasscode = (v2AuthState.role === "admin" || v2AuthState.role === "budget") ? passcode : "";
+      branchSession = v2AuthState.role === "branch" ? { branch: v2AuthState.branch, passcode } : { branch: "", passcode: "" };
+
+      ["inputAdminPass", "inputBudgetPass", "inputProgressPass", "inputBranchPass"].forEach(id => {
+        const el = document.getElementById(id);
+        if (el) el.value = "";
+      });
+
       closeAdminModal();
       syncV2AuthUI();
-      alert(`${v2DisplayBranch(branchSession.branch)} 登入成功`);
+
+      if ((v2AuthState.role === "progress" || v2AuthState.role === "branch") && typeof switchMainTab === "function") {
+        switchMainTab("progress");
+      }
+
+      alert(`${v2AuthState.label} 登入成功`);
     } else {
-      alert(json.message || "通行碼錯誤");
+      alert(json.message || "密碼錯誤");
     }
   } catch (err) {
     alert("連線失敗：" + err.message);
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = "確認登入"; }
   }
 }
 
-function logoutBranch() {
+function submitAdminLogin() {
+  v2SelectedLoginRole = "admin";
+  submitV2Login();
+}
+
+function submitBranchLogin() {
+  v2SelectedLoginRole = "branch";
+  submitV2Login();
+}
+
+function logoutV2Role() {
+  v2AuthState = { role: "guest", passcode: "", branch: "", label: "檢視模式" };
+  adminPasscode = "";
   branchSession = { branch: "", passcode: "" };
-  const inp = document.getElementById("inputBranchPass");
-  if (inp) inp.value = "";
   syncV2AuthUI();
 }
 
+function logoutAdmin() {
+  logoutV2Role();
+}
+
+function logoutBranch() {
+  logoutV2Role();
+}
+
 function syncV2AuthUI() {
-  const isAdmin = Boolean(adminPasscode);
-  const isBranch = Boolean(branchSession.branch && branchSession.passcode);
-  if (isAdmin && isBranch) branchSession = { branch: "", passcode: "" };
+  const isLoggedIn = v2AuthState.role !== "guest";
+  const isSystemAdmin = canEditApproval();
 
-  document.getElementById("menuAdminLogin")?.classList.toggle("hidden", isAdmin || Boolean(branchSession.branch));
-  document.getElementById("menuBranchLogout")?.classList.toggle("hidden", !branchSession.branch);
-  document.getElementById("adminIndicatorDot")?.classList.toggle("hidden", !(isAdmin || Boolean(branchSession.branch)));
+  document.getElementById("menuAdminLogin")?.classList.toggle("hidden", isLoggedIn);
+  document.getElementById("menuRoleLogout")?.classList.toggle("hidden", !isLoggedIn);
+  document.getElementById("menuImportExcel")?.classList.toggle("hidden", !isSystemAdmin);
+  document.getElementById("adminIndicatorDot")?.classList.toggle("hidden", !isLoggedIn);
 
-  const lblB = document.getElementById("lblBranchLogoutText");
-  if (lblB && branchSession.branch) lblB.textContent = `${v2DisplayBranch(branchSession.branch)} 登出`;
+  const lblLogout = document.getElementById("lblRoleLogoutText");
+  if (lblLogout && isLoggedIn) {
+    lblLogout.textContent = `${v2AuthState.label} (登出)`;
+  }
+
+  const quickBtn = document.getElementById("btnQuickLoginTrigger");
+  if (quickBtn) {
+    if (isLoggedIn) {
+      quickBtn.textContent = "登出";
+      quickBtn.onclick = () => logoutV2Role();
+    } else {
+      quickBtn.textContent = "身分登入";
+      quickBtn.onclick = () => openAdminModal();
+    }
+  }
 
   const badge = document.getElementById("v2AuthStatusBadge");
   if (badge) {
-    if (isAdmin) badge.innerHTML = `<span class="px-2 py-0.5 rounded bg-[#ED6D35]/15 text-[#ED6D35]">署端管理者</span>`;
-    else if (branchSession.branch) badge.innerHTML = `<span class="px-2 py-0.5 rounded bg-[#004E89]/15 text-[#004E89]">${v2DisplayBranch(branchSession.branch)}</span>`;
-    else badge.textContent = "檢視模式";
+    if (v2AuthState.role === "admin") {
+      badge.innerHTML = `<span class="px-2 py-0.5 rounded bg-[#ED6D35]/15 text-[#ED6D35]">系統管理（最高權限）</span>`;
+    } else if (v2AuthState.role === "budget") {
+      badge.innerHTML = `<span class="px-2 py-0.5 rounded bg-[#004E89]/15 text-[#004E89]">經費登載（專責編輯）</span>`;
+    } else if (v2AuthState.role === "progress") {
+      badge.innerHTML = `<span class="px-2 py-0.5 rounded bg-[#004E89]/15 text-[#004E89]">工程管考（全署管考）</span>`;
+    } else if (v2AuthState.role === "branch") {
+      badge.innerHTML = `<span class="px-2 py-0.5 rounded bg-[#1D3557]/15 text-[#1D3557]">${escapeHtmlAttr(v2AuthState.label)}（進度填報）</span>`;
+    } else {
+      badge.textContent = "檢視模式";
+    }
   }
 
   renderApprovalView();
-  if (typeof renderBudgetView === "function") renderBudgetView();
+  if (typeof renderProgressView === "function" && currentMainTab === "progress") {
+    renderProgressView();
+  }
+  if (typeof renderBudgetView === "function" && currentMainTab === "budget") {
+    renderBudgetView();
+  }
+  if (typeof renderEcologicalView === "function" && currentMainTab === "ecology") {
+    renderEcologicalView();
+  }
+  if (typeof renderDetailTable === "function" && currentMainTab === "history") {
+    renderDetailTable();
+  }
 }
 
 async function loadV2LifecycleData(forceNotify) {
@@ -117,23 +290,44 @@ async function loadV2LifecycleData(forceNotify) {
     v2CurrentMonth = json.currentMonth || "";
     v2LifecycleLoaded = true;
 
-    if (typeof initV2BudgetData === "function") initV2BudgetData(json);
+    if (typeof initV2ProgressData === "function") {
+      initV2ProgressData(json);
+    }
+    if (typeof initV2BudgetData === "function") {
+      initV2BudgetData(json);
+    }
+    if (typeof initV2EcologicalData === "function") {
+      initV2EcologicalData(json);
+    }
 
     const activeList = v2ActiveCases.filter(c => c.lifecycle_stage !== "撤案" && c.lifecycle_stage !== "已結案入庫");
     const pureEngCount = activeList.filter(v2IsPureEngineering).length;
+    const ecoCount = (json.ecologicalCases || []).length;
 
     const navApproved = document.getElementById("navBadgeApproved");
     const navPureEng = document.getElementById("navBadgePureEng");
     const navBudget = document.getElementById("navBadgeBudget");
+    const navEcology = document.getElementById("navBadgeEcology");
     const pCnt = document.getElementById("lblStage2ProgressCount");
+    const bCnt = document.getElementById("lblStage2BudgetCount");
 
     if (navApproved) navApproved.textContent = activeList.length;
     if (navPureEng) navPureEng.textContent = pureEngCount;
     if (navBudget) navBudget.textContent = activeList.length;
+    if (navEcology) navEcology.textContent = ecoCount;
     if (pCnt) pCnt.textContent = pureEngCount;
+    if (bCnt) bCnt.textContent = activeList.length;
 
     renderApprovalView();
-    if (typeof renderBudgetView === "function") renderBudgetView();
+    if (typeof renderProgressView === "function" && currentMainTab === "progress") {
+      renderProgressView();
+    }
+    if (typeof renderBudgetView === "function" && currentMainTab === "budget") {
+      renderBudgetView();
+    }
+    if (typeof renderEcologicalView === "function" && currentMainTab === "ecology") {
+      renderEcologicalView();
+    }
     if (forceNotify) alert(`資料已更新（共 ${v2ActiveCases.length} 筆）`);
   } catch (err) {
     if (container) container.innerHTML = `<div class="py-8 text-center text-xs text-rose-600">載入失敗：${escapeHtmlAttr(err.message)}</div>`;
@@ -155,7 +349,7 @@ function renderApprovalView() {
   if (!container) return;
 
   const prev = getApprovalFilters();
-  const isAdmin = Boolean(adminPasscode);
+  const isAdmin = canEditApproval();
   const activeList = v2ActiveCases.filter(c => c.lifecycle_stage !== "撤案" && c.lifecycle_stage !== "已結案入庫");
   const pureEngList = activeList.filter(v2IsPureEngineering);
   const otherList = activeList.filter(c => !v2IsPureEngineering(c));
@@ -213,7 +407,7 @@ function renderApprovalView() {
           <button type="button" onclick="openV2ApprovalCreateModal()" class="px-3 py-1 rounded bg-white hover:bg-[#FAF3E0] text-[#1D3557] border border-[#1D3557]/25 font-bold transition">＋ 新增案件</button>
           <button type="button" onclick="openV2PullFromMasterModal()" class="px-3 py-1 rounded bg-white hover:bg-[#FAF3E0] text-[#004E89] border border-[#004E89]/35 font-bold transition">帶入總庫年度</button>
           <button type="button" onclick="triggerV2ApprovalExcelInput()" class="px-3 py-1 rounded bg-[#ED6D35] hover:bg-[#D65A24] text-white font-bold transition">匯入核定 Excel</button>
-        ` : `<button type="button" onclick="openAdminModal(); switchLoginRole('admin');" class="px-3 py-1 rounded bg-[#ED6D35] text-white font-bold">署端登入</button>`}
+        ` : `<span class="text-[11px] text-[#1D3557]/60">唯讀檢視（僅系統管理可匯入與編輯）</span>`}
       </div>
     </div>
 
@@ -259,7 +453,7 @@ function getFilteredApprovalRows() {
     if (phase !== "ALL" && c["核定梯次"] !== phase) return false;
     if (branch !== "ALL" && v2NormBranch(c["分署"]) !== branch) return false;
     if (kw) {
-      const hay = `${c.case_uid} ${c["案件名稱"]} ${c["工程編號"]} ${c["縣市"]} ${c["鄉鎮"] || ""} ${c["水系"]} ${c["溪別"] || ""} ${c["地方關切"]}`.toLowerCase();
+      const hay = `${c.case_uid} ${c["案件名稱"]} ${c["工程編號"]} ${c["前次工程編號"] || ""} ${c["縣市"]} ${c["鄉鎮"] || ""} ${c["水系"]} ${c["溪別"] || ""} ${c["地方關切"]}`.toLowerCase();
       if (!hay.includes(kw)) return false;
     }
     return true;
@@ -267,7 +461,7 @@ function getFilteredApprovalRows() {
 }
 
 function startInlineCodeEdit(uid) {
-  if (!adminPasscode) return;
+  if (!canEditApproval()) return;
   const c = v2ActiveCases.find(x => x.case_uid === uid);
   if (!c) return;
   const cell = document.getElementById(`codeCell_${uid}`);
@@ -301,7 +495,7 @@ async function handleInlineCodeKey(event, uid) {
       method: "POST",
       body: JSON.stringify({
         action: "v2_update_approval",
-        passcode: adminPasscode,
+        passcode: v2AuthState.passcode,
         record: { case_uid: uid, "工程編號": newCode }
       })
     });
@@ -310,7 +504,6 @@ async function handleInlineCodeKey(event, uid) {
       const target = v2ActiveCases.find(x => x.case_uid === uid);
       if (target) target["工程編號"] = newCode;
       renderApprovalView();
-      if (typeof renderBudgetView === "function") renderBudgetView();
     } else {
       alert(json.message || "儲存失敗");
       renderApprovalTableBody();
@@ -324,7 +517,7 @@ async function handleInlineCodeKey(event, uid) {
 function renderApprovalTableBody() {
   const tbody = document.getElementById("tbodyApproval");
   if (!tbody) return;
-  const isAdmin = Boolean(adminPasscode);
+  const isAdmin = canEditApproval();
   const rows = getFilteredApprovalRows();
   const colSpan = isAdmin ? 9 : 8;
 
@@ -350,6 +543,8 @@ function renderApprovalTableBody() {
       ? `<div id="codeCell_${c.case_uid}" onclick="startInlineCodeEdit('${c.case_uid}')" title="點擊快速編輯工程編號" class="cursor-pointer px-1.5 py-0.5 rounded hover:bg-[#FAF3E0] inline-block transition">${codeInner}</div>`
       : `<div>${codeInner}</div>`;
 
+    const prevCodeStr = String(c["前次工程編號"] || "").trim();
+
     return `
       <tr class="${bg} hover:bg-[#FAF3E0]/70 ${isCancelled ? "opacity-55" : ""}">
         <td class="px-2 py-2 text-center whitespace-nowrap">
@@ -373,6 +568,7 @@ function renderApprovalTableBody() {
         <td class="px-2 py-2 text-center whitespace-nowrap">
           ${codeCellHtml}
           ${c["核定文號"] ? `<div class="text-[10px] text-[#1D3557]/55">${escapeHtmlAttr(c["核定文號"])}</div>` : ""}
+          ${prevCodeStr ? `<div class="text-[10px] text-[#004E89] font-mono" title="${escapeHtmlAttr(c["重新核定歷程"] || "")}">原：${escapeHtmlAttr(prevCodeStr)}</div>` : ""}
         </td>
         <td class="px-2 py-2 text-center">${c["地方關切"] ? `<span class="inline-block px-1.5 py-0.5 rounded bg-[#FAF3E0] text-[#004E89] border border-[#004E89]/25 text-[11px]">${escapeHtmlAttr(c["地方關切"])}</span>` : "-"}</td>
         ${isAdmin ? `<td class="px-2 py-2 text-center whitespace-nowrap"><button type="button" onclick="openV2ApprovalEditModal('${c.case_uid}')" class="px-2.5 py-1 rounded bg-[#FAF3E0] hover:bg-[#ED6D35] text-[#1D3557] hover:text-white border border-[#1D3557]/20 font-bold text-[11px] transition">編輯</button></td>` : ""}
@@ -382,7 +578,7 @@ function renderApprovalTableBody() {
 }
 
 function openV2PullFromMasterModal() {
-  if (!adminPasscode) return alert("請先登入署端帳號");
+  if (!canEditApproval()) return alert("僅「系統管理」身分可執行此操作");
   ensureV2ApprovalModals();
   const years = Array.from(new Set((allRecords || []).map(r => String(r["年度"])).filter(Boolean))).sort().reverse();
   const sel = document.getElementById("selV2PullMasterYear");
@@ -412,9 +608,9 @@ async function confirmV2PullFromMaster() {
     "性質": typeof formatAppendixToNature === "function" ? formatAppendixToNature(r["附表"]) : r["附表"],
     "類別": normalizeCategoryName(r["類別"]),
     "縣市": r["縣市"],
-    "鄉鎮": "",
+    "鄉鎮": r["鄉鎮"] || "",
     "水系": r["水系"],
-    "溪別": "",
+    "溪別": r["溪別"] || "",
     "案件名稱": r["案件名稱"],
     "核定經費_千元": parseFloat(r["核定經費_千元"]) || 0,
     "可支用經費_千元": parseFloat(r["可支用經費_千元"]) || 0,
@@ -436,7 +632,7 @@ async function confirmV2PullFromMaster() {
       method: "POST",
       body: JSON.stringify({
         action: "v2_import_approval",
-        passcode: adminPasscode,
+        passcode: v2AuthState.passcode,
         phase,
         records: payloadRecords
       })
@@ -445,7 +641,7 @@ async function confirmV2PullFromMaster() {
     if (json.status === "success") {
       document.getElementById("modalV2PullMaster").classList.add("hidden");
       alert(json.message);
-      await loadV2LifecycleData(false);
+      await reloadAllV2Data(false);
     } else {
       alert(json.message || "帶入失敗");
     }
@@ -457,10 +653,60 @@ async function confirmV2PullFromMaster() {
 }
 
 function triggerV2ApprovalExcelInput() {
-  if (!adminPasscode) return alert("請先登入署端帳號");
+  if (!canEditApproval()) return alert("僅「系統管理」身分可匯入 Excel");
   const inp = document.getElementById("fileV2ApprovalExcel");
   if (!inp) return alert("找不到檔案上傳元件");
   inp.click();
+}
+
+function onV2ImportBindChange(idx, val) {
+  if (v2PendingApprovalImport[idx]) {
+    v2PendingApprovalImport[idx].target_case_uid = String(val || "").trim();
+  }
+}
+
+function renderV2ImportPreviewTable() {
+  const tbody = document.getElementById("tbodyV2AppImport");
+  if (!tbody) return;
+
+  tbody.innerHTML = v2PendingApprovalImport.map((r, idx) => {
+    const brKey = v2NormBranch(r["分署"]);
+    const yr = String(r["核定年度"] || "").trim();
+    const sameBranchCases = (v2ActiveCases || []).filter(c =>
+      c.lifecycle_stage !== "撤案" &&
+      String(c["核定年度"] || "").trim() !== yr &&
+      v2NormBranch(c["分署"]) === brKey
+    );
+
+    const isLinked = Boolean(r.target_case_uid);
+    const rowBg = isLinked ? "bg-[#FAF3E0]" : "bg-white";
+
+    const optsHtml = [
+      `<option value="" ${!isLinked ? "selected" : ""}>新案件（配發新 case_uid）</option>`,
+      ...sameBranchCases.map(c => {
+        const sel = r.target_case_uid === c.case_uid ? "selected" : "";
+        const autoTag = (r._autoMatchedUid === c.case_uid) ? "【偵測同案】" : "";
+        return `<option value="${escapeHtmlAttr(c.case_uid)}" ${sel}>${autoTag}跨年重核定 → ${escapeHtmlAttr(c.case_uid)} (${escapeHtmlAttr(c["核定年度"])}年｜${escapeHtmlAttr(c["工程編號"] || "無編號")}｜${escapeHtmlAttr(String(c["案件名稱"] || "").slice(0, 16))})</option>`;
+      })
+    ].join("");
+
+    return `
+      <tr class="${rowBg}">
+        <td class="p-1.5 text-center whitespace-nowrap">${escapeHtmlAttr(r["核定年度"])}</td>
+        <td class="p-1.5 text-center whitespace-nowrap">${escapeHtmlAttr(r["分署"])}</td>
+        <td class="p-1.5 text-center whitespace-nowrap">${escapeHtmlAttr(r["縣市"] || "")}${escapeHtmlAttr(r["鄉鎮"] || "")}</td>
+        <td class="p-1.5 text-center whitespace-nowrap">${escapeHtmlAttr(r["水系"] || "-")} / ${escapeHtmlAttr(r["溪別"] || "-")}</td>
+        <td class="p-1.5">${escapeHtmlAttr(r["案件名稱"])}</td>
+        <td class="p-1.5 text-right font-mono whitespace-nowrap">${r["核定經費_千元"].toLocaleString()}</td>
+        <td class="p-1.5">
+          <select onchange="onV2ImportBindChange(${idx}, this.value); renderV2ImportPreviewTable();"
+                  class="w-full max-w-[250px] border ${isLinked ? "border-[#ED6D35] font-bold text-[#ED6D35]" : "border-[#1D3557]/20 text-[#1D3557]"} rounded px-1.5 py-1 bg-white text-[11px]">
+            ${optsHtml}
+          </select>
+        </td>
+      </tr>
+    `;
+  }).join("");
 }
 
 function handleV2ApprovalExcelSelect(event) {
@@ -475,6 +721,7 @@ function handleV2ApprovalExcelSelect(event) {
     const parsed = [];
     let fallbackCnt = 0;
     let concernCnt = 0;
+    let autoReapproveCnt = 0;
 
     wb.SheetNames.forEach((sheetName, idx) => {
       const meta = wb.Workbook?.Sheets?.[idx];
@@ -570,7 +817,7 @@ function handleV2ApprovalExcelSelect(event) {
           if (concernText) concernCnt++;
         }
 
-        parsed.push({
+        const itemObj = {
           "核定年度": normalizeText(getV(cYear) || defaultYear),
           "分署": bName,
           "性質": formatAppendixToNature(normalizeText(getV(cApp) || sheetName)),
@@ -590,26 +837,27 @@ function handleV2ApprovalExcelSelect(event) {
           "水防道路_m2": parseExcelNumber(getV(cRoad)),
           "其他結構說明": normalizeText(getV(cOther)),
           "備註資訊": remarkText,
-          "地方關切": concernText
-        });
+          "地方關切": concernText,
+          target_case_uid: "",
+          _autoMatchedUid: ""
+        };
+
+        const cand = findCrossYearCandidateForImport(itemObj);
+        if (cand) {
+          itemObj.target_case_uid = cand.case_uid;
+          itemObj._autoMatchedUid = cand.case_uid;
+          autoReapproveCnt++;
+        }
+
+        parsed.push(itemObj);
       }
     });
 
     v2PendingApprovalImport = parsed;
     ensureV2ApprovalModals();
     document.getElementById("lblV2AppImportSummary").textContent =
-      `《${file.name}》共 ${parsed.length} 筆（需求代核定 ${fallbackCnt} 筆、地方關切 ${concernCnt} 筆）`;
-    document.getElementById("tbodyV2AppImport").innerHTML = parsed.slice(0, 100).map(r => `
-      <tr>
-        <td class="p-1.5 text-center">${r["核定年度"]}</td>
-        <td class="p-1.5 text-center">${r["分署"]}</td>
-        <td class="p-1.5 text-center">${escapeHtmlAttr(r["縣市"] || "")}${escapeHtmlAttr(r["鄉鎮"] || "")}</td>
-        <td class="p-1.5 text-center">${escapeHtmlAttr(r["水系"] || "-")} / ${escapeHtmlAttr(r["溪別"] || "-")}</td>
-        <td class="p-1.5">${escapeHtmlAttr(r["案件名稱"])}</td>
-        <td class="p-1.5 text-right font-mono">${r["核定經費_千元"].toLocaleString()}</td>
-        <td class="p-1.5 text-center">${r["地方關切"] ? `<span class="px-1.5 py-0.5 rounded bg-[#FAF3E0] text-[#004E89] border border-[#004E89]/25">${escapeHtmlAttr(r["地方關切"])}</span>` : "-"}</td>
-      </tr>
-    `).join("");
+      `《${file.name}》共 ${parsed.length} 筆（偵測跨年重核定舊案 ${autoReapproveCnt} 筆、需求代核定 ${fallbackCnt} 筆、地方關切 ${concernCnt} 筆）`;
+    renderV2ImportPreviewTable();
     document.getElementById("modalV2AppImport").classList.remove("hidden");
     event.target.value = "";
   };
@@ -622,20 +870,26 @@ async function confirmV2ApprovalImport() {
   const btn = document.getElementById("btnConfirmV2AppImport");
   if (btn) { btn.disabled = true; btn.textContent = "寫入中..."; }
   try {
+    const cleanRecords = v2PendingApprovalImport.map(r => {
+      const copy = { ...r };
+      delete copy._autoMatchedUid;
+      return copy;
+    });
+
     const res = await fetch(GAS_API_URL, {
       method: "POST",
       body: JSON.stringify({
         action: "v2_import_approval",
-        passcode: adminPasscode,
+        passcode: v2AuthState.passcode,
         phase,
-        records: v2PendingApprovalImport
+        records: cleanRecords
       })
     });
     const json = await res.json();
     if (json.status === "success") {
       document.getElementById("modalV2AppImport").classList.add("hidden");
       alert(json.message);
-      await loadV2LifecycleData(false);
+      await reloadAllV2Data(false);
     } else {
       alert(json.message || "匯入失敗");
     }
@@ -647,12 +901,16 @@ async function confirmV2ApprovalImport() {
 }
 
 function openV2ApprovalCreateModal() {
-  if (!adminPasscode) return alert("請先登入署端帳號");
+  if (!canEditApproval()) return alert("僅「系統管理」身分可新增案件");
   ensureV2ApprovalModals();
   const rocYear = String(new Date().getFullYear() - 1911);
   document.getElementById("v2EdModalTitle").textContent = "新增核定案件";
   document.getElementById("v2EdUid").value = "";
   document.getElementById("v2EdUidBadge").textContent = "存檔後自動配發";
+  document.getElementById("btnToggleReapprovePanel")?.classList.add("hidden");
+  document.getElementById("v2ReapprovePanel")?.classList.add("hidden");
+  document.getElementById("v2ReapproveHistoryBox")?.classList.add("hidden");
+
   document.getElementById("v2EdStage").value = "執行管考中";
   document.getElementById("v2EdYear").value = rocYear;
   document.getElementById("v2EdPhase").value = "先期";
@@ -680,13 +938,39 @@ function openV2ApprovalCreateModal() {
 }
 
 function openV2ApprovalEditModal(uid) {
-  if (!adminPasscode) return alert("請先登入署端帳號");
+  if (!canEditApproval()) return alert("僅「系統管理」身分可編輯基本資料");
   ensureV2ApprovalModals();
   const c = v2ActiveCases.find(x => x.case_uid === uid);
   if (!c) return;
+
   document.getElementById("v2EdModalTitle").textContent = "編輯核定案件（完整資料）";
   document.getElementById("v2EdUid").value = uid;
   document.getElementById("v2EdUidBadge").textContent = uid;
+  document.getElementById("btnToggleReapprovePanel")?.classList.remove("hidden");
+  document.getElementById("v2ReapprovePanel")?.classList.add("hidden");
+
+  const nextYr = String((parseInt(c["核定年度"], 10) || (new Date().getFullYear() - 1911)) + 1);
+  if (document.getElementById("v2ReappYear")) document.getElementById("v2ReappYear").value = nextYr;
+  if (document.getElementById("v2ReappPhase")) document.getElementById("v2ReappPhase").value = "先期";
+  if (document.getElementById("v2ReappCode")) document.getElementById("v2ReappCode").value = "";
+  if (document.getElementById("v2ReappDocNo")) document.getElementById("v2ReappDocNo").value = "";
+  if (document.getElementById("v2ReappApproved")) document.getElementById("v2ReappApproved").value = c["核定經費_千元"] || 0;
+  if (document.getElementById("v2ReappUsable")) document.getElementById("v2ReappUsable").value = c["可支用經費_千元"] || 0;
+  if (document.getElementById("v2ReappRemark")) document.getElementById("v2ReappRemark").value = "";
+
+  const prevCodes = String(c["前次工程編號"] || "").trim();
+  const reapprLog = String(c["重新核定歷程"] || "").trim();
+  const histBox = document.getElementById("v2ReapproveHistoryBox");
+  if (histBox) {
+    if (prevCodes || reapprLog) {
+      histBox.classList.remove("hidden");
+      document.getElementById("lblV2PrevCodes").textContent = prevCodes || "-";
+      document.getElementById("lblV2ReapprLog").textContent = reapprLog || "-";
+    } else {
+      histBox.classList.add("hidden");
+    }
+  }
+
   document.getElementById("v2EdStage").value = c.lifecycle_stage === "撤案" ? "撤案" : "執行管考中";
   document.getElementById("v2EdYear").value = c["核定年度"] || "";
   document.getElementById("v2EdPhase").value = c["核定梯次"] || "先期";
@@ -711,6 +995,60 @@ function openV2ApprovalEditModal(uid) {
   document.getElementById("v2EdConcern").value = c["地方關切"] || "";
   document.getElementById("v2EdRemark").value = c["備註資訊"] || "";
   document.getElementById("modalV2AppEdit").classList.remove("hidden");
+}
+
+function toggleV2ReapprovePanel() {
+  document.getElementById("v2ReapprovePanel")?.classList.toggle("hidden");
+}
+
+async function submitV2ReapproveCase() {
+  if (!canEditApproval()) return alert("僅「系統管理」身分可執行此操作");
+  const uid = document.getElementById("v2EdUid").value.trim();
+  if (!uid) return;
+  const newYear = document.getElementById("v2ReappYear").value.trim();
+  const newPhase = document.getElementById("v2ReappPhase").value;
+  const newCode = document.getElementById("v2ReappCode").value.trim();
+  const newDocNo = document.getElementById("v2ReappDocNo").value.trim();
+  const newApproved = parseFloat(document.getElementById("v2ReappApproved").value) || 0;
+  const newUsable = parseFloat(document.getElementById("v2ReappUsable").value) || 0;
+  const remark = document.getElementById("v2ReappRemark").value.trim();
+
+  if (!newYear) return alert("請輸入新核定年度");
+  if (!confirm(`確認為案件 ${uid} 辦理 ${newYear} 年度重新核定換號？（原 case_uid 終身保留，舊工程編號將自動歸入前次工程編號）`)) return;
+
+  const btn = document.getElementById("btnConfirmV2Reapprove");
+  if (btn) { btn.disabled = true; btn.textContent = "處理中..."; }
+  try {
+    const res = await fetch(GAS_API_URL, {
+      method: "POST",
+      body: JSON.stringify({
+        action: "v2_reapprove_case",
+        passcode: v2AuthState.passcode,
+        record: {
+          case_uid: uid,
+          new_year: newYear,
+          new_phase: newPhase,
+          new_code: newCode,
+          new_doc_no: newDocNo,
+          new_approved_amt: newApproved,
+          new_usable_amt: newUsable,
+          reapprove_remark: remark
+        }
+      })
+    });
+    const json = await res.json();
+    if (json.status === "success") {
+      document.getElementById("modalV2AppEdit").classList.add("hidden");
+      alert(json.message);
+      await reloadAllV2Data(false);
+    } else {
+      alert(json.message || "辦理失敗");
+    }
+  } catch (err) {
+    alert("連線失敗：" + err.message);
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = "確認辦理跨年重核定"; }
+  }
 }
 
 async function saveV2ApprovalEdit() {
@@ -753,7 +1091,7 @@ async function saveV2ApprovalEdit() {
       method: "POST",
       body: JSON.stringify({
         action: isCreate ? "v2_create_approval" : "v2_update_approval",
-        passcode: adminPasscode,
+        passcode: v2AuthState.passcode,
         record
       })
     });
@@ -761,7 +1099,7 @@ async function saveV2ApprovalEdit() {
     if (json.status === "success") {
       document.getElementById("modalV2AppEdit").classList.add("hidden");
       alert(json.message);
-      await loadV2LifecycleData(false);
+      await reloadAllV2Data(false);
     } else {
       alert(json.message || "儲存失敗");
     }
@@ -805,9 +1143,9 @@ function ensureV2ApprovalModals() {
     const d = document.createElement("div");
     d.innerHTML = `
       <div id="modalV2AppImport" class="hidden fixed inset-0 bg-[#1D3557]/65 flex items-center justify-center z-50 p-4">
-        <div class="bg-[#F7F5F0] rounded-lg shadow-xl p-5 w-full max-w-4xl space-y-3 text-xs">
+        <div class="bg-[#F7F5F0] rounded-lg shadow-xl p-5 w-full max-w-6xl space-y-3 text-xs">
           <div class="flex flex-wrap items-center justify-between gap-2">
-            <h2 class="text-base font-bold text-[#ED6D35]">核定 Excel 匯入預覽</h2>
+            <h2 class="text-base font-bold text-[#ED6D35]">核定 Excel 匯入預覽（支援跨年重新核定綁定原 case_uid）</h2>
             <div class="flex items-center gap-1.5">
               <label class="font-bold text-[#1D3557]">梯次：</label>
               <select id="selV2ImportPhase" class="border border-[#1D3557]/25 rounded px-2 py-1 bg-white text-[#1D3557] font-bold">
@@ -817,9 +1155,9 @@ function ensureV2ApprovalModals() {
             </div>
           </div>
           <p id="lblV2AppImportSummary" class="font-bold text-[#1D3557]"></p>
-          <div class="max-h-[340px] overflow-y-auto bg-white border border-[#1D3557]/15 rounded">
+          <div class="max-h-[360px] overflow-y-auto bg-white border border-[#1D3557]/15 rounded">
             <table class="w-full text-xs border-collapse">
-              <thead><tr><th class="p-2">年度</th><th class="p-2">分署</th><th class="p-2">縣市鄉鎮</th><th class="p-2">水系 / 溪別</th><th class="p-2">案件名稱</th><th class="p-2 text-right">核定經費</th><th class="p-2 text-center">地方關切</th></tr></thead>
+              <thead><tr><th class="p-2">年度</th><th class="p-2">分署</th><th class="p-2">縣市鄉鎮</th><th class="p-2">水系 / 溪別</th><th class="p-2">案件名稱</th><th class="p-2 text-right">核定經費</th><th class="p-2">案件歸屬 / 綁定方式</th></tr></thead>
               <tbody id="tbodyV2AppImport" class="divide-y divide-slate-200"></tbody>
             </table>
           </div>
@@ -850,7 +1188,59 @@ function ensureV2ApprovalModals() {
 
           <!-- 區段 1：案件資訊 -->
           <div class="bg-white border border-[#1D3557]/12 rounded p-3 space-y-2.5">
-            <div class="font-bold text-[#004E89] border-b border-slate-100 pb-1">1. 案件資訊</div>
+            <div class="flex items-center justify-between border-b border-slate-100 pb-1">
+              <span class="font-bold text-[#004E89]">1. 案件資訊</span>
+              <button type="button" id="btnToggleReapprovePanel" onclick="toggleV2ReapprovePanel()" class="px-2.5 py-0.5 rounded bg-[#FAF3E0] hover:bg-[#ED6D35] text-[#ED6D35] hover:text-white border border-[#ED6D35]/40 font-bold text-[11px] transition">
+                辦理跨年度重新核定（換號）
+              </button>
+            </div>
+
+            <!-- 跨年度重新核定（換號）展開面板 -->
+            <div id="v2ReapprovePanel" class="hidden bg-[#FAF3E0] border border-[#ED6D35]/40 rounded p-2.5 space-y-2">
+              <div class="font-bold text-[#ED6D35]">跨年度重新核定（前年度未發生權責換號 — 保留原 case_uid 終身身分）</div>
+              <div class="grid grid-cols-3 gap-2">
+                <div>
+                  <label class="font-bold block mb-0.5">新核定年度</label>
+                  <input id="v2ReappYear" type="text" class="w-full border border-[#1D3557]/20 bg-white rounded px-2 py-1 font-mono" />
+                </div>
+                <div>
+                  <label class="font-bold block mb-0.5">新梯次</label>
+                  <select id="v2ReappPhase" class="w-full border border-[#1D3557]/20 bg-white rounded px-2 py-1">
+                    <option value="先期">先期</option>
+                    <option value="期中">期中</option>
+                  </select>
+                </div>
+                <div>
+                  <label class="font-bold block mb-0.5">新工程編號</label>
+                  <input id="v2ReappCode" type="text" placeholder="輸入新年度工程編號" class="w-full border border-[#1D3557]/20 bg-white rounded px-2 py-1 font-mono" />
+                </div>
+              </div>
+              <div class="grid grid-cols-3 gap-2">
+                <div>
+                  <label class="font-bold block mb-0.5">新核定文號</label>
+                  <input id="v2ReappDocNo" type="text" placeholder="新核定文號" class="w-full border border-[#1D3557]/20 bg-white rounded px-2 py-1" />
+                </div>
+                <div>
+                  <label class="font-bold block mb-0.5">新核定經費 (千元)</label>
+                  <input id="v2ReappApproved" type="number" step="0.001" class="w-full border border-[#1D3557]/20 bg-white rounded px-2 py-1 font-mono" />
+                </div>
+                <div>
+                  <label class="font-bold block mb-0.5">新可支用經費 (千元)</label>
+                  <input id="v2ReappUsable" type="number" step="0.001" class="w-full border border-[#1D3557]/20 bg-white rounded px-2 py-1 font-mono" />
+                </div>
+              </div>
+              <div class="flex items-center gap-2">
+                <input id="v2ReappRemark" type="text" placeholder="重核定備註說明（選填，如：114年底未發生權責重核定）" class="flex-1 border border-[#1D3557]/20 bg-white rounded px-2 py-1" />
+                <button type="button" id="btnConfirmV2Reapprove" onclick="submitV2ReapproveCase()" class="px-3 py-1 bg-[#ED6D35] hover:bg-[#D65A24] text-white rounded font-bold shrink-0">確認辦理跨年重核定</button>
+              </div>
+            </div>
+
+            <!-- 歷次跨年換號軌跡唯讀提示 -->
+            <div id="v2ReapproveHistoryBox" class="hidden bg-[#F7F5F0] border border-[#004E89]/25 rounded px-2.5 py-1.5 text-[11px] space-y-0.5">
+              <div><span class="font-bold text-[#004E89]">前次工程編號：</span><span id="lblV2PrevCodes" class="font-mono text-[#1D3557]"></span></div>
+              <div><span class="font-bold text-[#004E89]">重新核定歷程：</span><span id="lblV2ReapprLog" class="text-[#1D3557]/85"></span></div>
+            </div>
+
             <div class="grid grid-cols-3 gap-2.5">
               <div>
                 <label class="font-bold block mb-1">核定年度</label>
